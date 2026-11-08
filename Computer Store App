@@ -1,0 +1,935 @@
+// pcstore.cpp - Computer parts store (command-line, object-oriented C++17)
+//
+// Style:  uses ONLY "using namespace std;" - no prefixes on library names, no other using or namespace.
+//
+// Build:  g++ -std=c++17 -O2 -Wall -Wextra -o pcstore pcstore.cpp
+// Run:    ./pcstore          (Windows: pcstore.exe)
+//
+// Class overview
+//   Product (abstract)  <- Cpu, Gpu, Motherboard, Memory, Storage, PowerSupply,
+//                          PcCase, Cooler, Monitor, Peripheral
+//   Catalog             owns every Product, finds / filters / searches them
+//   Basket              holds BasketItems (product + quantity), add / remove / change qty
+//   CompatibilityChecker  warns about CPU/board socket, RAM type, case size, PSU wattage
+//   Console             safe keyboard input helpers
+//   Store               menus and the whole customer flow (browse, basket, checkout)
+//
+// To change the stock, edit Catalog::populate() near the bottom of the classes.
+// Prices are approximate US-dollar retail prices and WILL differ from real shops:
+// update them to your own prices before you use the program for real.
+
+#include <algorithm>
+#include <cctype>
+#include <ctime>
+#include <exception>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <memory>
+#include <sstream>
+#include <string>
+#include <utility>
+#include <vector>
+
+using namespace std;  // the only "using" / namespace in this program
+
+// ============================================================ small helpers
+
+string trim(const string& s) {
+    size_t a = s.find_first_not_of(" \t\r\n");
+    if (a == string::npos) return "";
+    size_t b = s.find_last_not_of(" \t\r\n");
+    return s.substr(a, b - a + 1);
+}
+
+string toLower(string s) {
+    for (char& c : s) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+// Money is stored as whole cents (long long) so there are no floating-point errors.
+constexpr long long usd(long long dollars) { return dollars * 100; }
+
+string formatMoney(long long cents) {
+    bool negative = cents < 0;
+    if (negative) cents = -cents;
+    string dollars = to_string(cents / 100);
+    for (int i = static_cast<int>(dollars.size()) - 3; i > 0; i -= 3)
+        dollars.insert(static_cast<size_t>(i), ",");
+    ostringstream os;
+    os << (negative ? "-" : "") << '$' << dollars << '.' << setw(2) << setfill('0') << cents % 100;
+    return os.str();
+}
+
+string num(double v, int decimals = 1) {
+    ostringstream os;
+    os << fixed << setprecision(decimals) << v;
+    return os.str();
+}
+
+// Pads or cuts text to an exact width so table columns line up.
+string fit(const string& s, size_t width) {
+    if (s.size() <= width) return s + string(width - s.size(), ' ');
+    return s.substr(0, width - 3) + "...";
+}
+
+string padLeft(const string& s, size_t width) {
+    return s.size() >= width ? s : string(width - s.size(), ' ') + s;
+}
+
+string line(char c, size_t n) { return string(n, c); }
+
+string timestamp(const char* format) {
+    time_t t = time(nullptr);
+    tm parts{};
+#ifdef _WIN32
+    localtime_s(&parts, &t);
+#else
+    localtime_r(&t, &parts);
+#endif
+    char buf[64];
+    strftime(buf, sizeof buf, format, &parts);
+    return buf;
+}
+
+
+// ============================================================ enums
+
+enum class Category { Cpu, Gpu, Motherboard, Memory, Storage, PowerSupply, Case, Cooler, Monitor, Peripheral };
+
+const vector<Category> kAllCategories = {Category::Cpu,         Category::Gpu,     Category::Motherboard,
+                                              Category::Memory,      Category::Storage, Category::PowerSupply,
+                                              Category::Case,        Category::Cooler,  Category::Monitor,
+                                              Category::Peripheral};
+
+const char* categoryName(Category c) {
+    switch (c) {
+        case Category::Cpu: return "Processors (CPU)";
+        case Category::Gpu: return "Graphics Cards (GPU)";
+        case Category::Motherboard: return "Motherboards";
+        case Category::Memory: return "Memory (RAM)";
+        case Category::Storage: return "Storage (SSD / HDD)";
+        case Category::PowerSupply: return "Power Supplies (PSU)";
+        case Category::Case: return "PC Cases";
+        case Category::Cooler: return "CPU Coolers";
+        case Category::Monitor: return "Monitors";
+        case Category::Peripheral: return "Peripherals";
+    }
+    return "?";
+}
+
+// Ordered from smallest to largest: a case that fits ATX also fits the smaller sizes.
+enum class FormFactor { MiniITX = 0, MicroATX = 1, ATX = 2 };
+
+const char* formFactorName(FormFactor f) {
+    switch (f) {
+        case FormFactor::MiniITX: return "Mini-ITX";
+        case FormFactor::MicroATX: return "Micro-ATX";
+        case FormFactor::ATX: return "ATX";
+    }
+    return "?";
+}
+
+enum class StorageKind { NVMe, SataSsd, Hdd };
+
+const char* storageKindName(StorageKind k) {
+    switch (k) {
+        case StorageKind::NVMe: return "NVMe SSD";
+        case StorageKind::SataSsd: return "SATA SSD";
+        case StorageKind::Hdd: return "Hard disk (HDD)";
+    }
+    return "?";
+}
+
+// ============================================================ Product hierarchy
+
+class Product {
+public:
+    Product(int id, Category category, string brand, string name, long long priceCents, int stock)
+        : id_(id), category_(category), brand_(move(brand)), name_(move(name)),
+          priceCents_(priceCents), stock_(stock) {}
+    virtual ~Product() = default;
+
+    int id() const { return id_; }
+    Category category() const { return category_; }
+    const string& brand() const { return brand_; }
+    const string& name() const { return name_; }
+    string fullName() const { return brand_ + " " + name_; }
+    long long priceCents() const { return priceCents_; }
+    int stock() const { return stock_; }
+
+    // Removes units from stock when an order is placed. Returns false if there isn't enough.
+    bool takeStock(int quantity) {
+        if (quantity <= 0 || quantity > stock_) return false;
+        stock_ -= quantity;
+        return true;
+    }
+
+    // Each kind of part describes its own technical details.
+    virtual vector<string> specs() const = 0;
+
+private:
+    int id_;
+    Category category_;
+    string brand_, name_;
+    long long priceCents_;
+    int stock_;
+};
+
+class Cpu : public Product {
+public:
+    Cpu(int id, string brand, string name, long long price, int stock, string socket, int cores,
+        int threads, double baseGhz, double boostGhz, int tdpW)
+        : Product(id, Category::Cpu, move(brand), move(name), price, stock), socket_(move(socket)),
+          cores_(cores), threads_(threads), baseGhz_(baseGhz), boostGhz_(boostGhz), tdpW_(tdpW) {}
+
+    const string& socket() const { return socket_; }
+    int tdpW() const { return tdpW_; }
+
+    vector<string> specs() const override {
+        return {"Socket: " + socket_,
+                "Cores / threads: " + to_string(cores_) + " / " + to_string(threads_),
+                "Clock: " + num(baseGhz_) + " GHz base, up to " + num(boostGhz_) + " GHz boost",
+                "Power (TDP): " + to_string(tdpW_) + " W"};
+    }
+
+private:
+    string socket_;
+    int cores_, threads_;
+    double baseGhz_, boostGhz_;
+    int tdpW_;
+};
+
+class Gpu : public Product {
+public:
+    Gpu(int id, string brand, string name, long long price, int stock, int vramGb, int tdpW)
+        : Product(id, Category::Gpu, move(brand), move(name), price, stock), vramGb_(vramGb), tdpW_(tdpW) {}
+
+    int tdpW() const { return tdpW_; }
+
+    vector<string> specs() const override {
+        return {"Video memory: " + to_string(vramGb_) + " GB",
+                "Board power: " + to_string(tdpW_) + " W"};
+    }
+
+private:
+    int vramGb_, tdpW_;
+};
+
+class Motherboard : public Product {
+public:
+    Motherboard(int id, string brand, string name, long long price, int stock, string socket,
+                string chipset, string memoryType, FormFactor form, bool wifi)
+        : Product(id, Category::Motherboard, move(brand), move(name), price, stock),
+          socket_(move(socket)), chipset_(move(chipset)), memoryType_(move(memoryType)),
+          form_(form), wifi_(wifi) {}
+
+    const string& socket() const { return socket_; }
+    const string& memoryType() const { return memoryType_; }
+    FormFactor formFactor() const { return form_; }
+
+    vector<string> specs() const override {
+        return {"CPU socket: " + socket_, "Chipset: " + chipset_, "Memory type: " + memoryType_,
+                string("Size: ") + formFactorName(form_), string("Wi-Fi: ") + (wifi_ ? "yes" : "no")};
+    }
+
+private:
+    string socket_, chipset_, memoryType_;
+    FormFactor form_;
+    bool wifi_;
+};
+
+class Memory : public Product {
+public:
+    Memory(int id, string brand, string name, long long price, int stock, string type, int totalGb,
+           string kit, int speedMts, int cas)
+        : Product(id, Category::Memory, move(brand), move(name), price, stock), type_(move(type)),
+          totalGb_(totalGb), kit_(move(kit)), speedMts_(speedMts), cas_(cas) {}
+
+    const string& type() const { return type_; }
+
+    vector<string> specs() const override {
+        return {"Type: " + type_, "Capacity: " + to_string(totalGb_) + " GB (" + kit_ + ")",
+                "Speed: " + to_string(speedMts_) + " MT/s", "Latency: CL" + to_string(cas_)};
+    }
+
+private:
+    string type_;
+    int totalGb_;
+    string kit_;
+    int speedMts_, cas_;
+};
+
+class Storage : public Product {
+public:
+    Storage(int id, string brand, string name, long long price, int stock, StorageKind kind, int capacityGb,
+            string speedNote)
+        : Product(id, Category::Storage, move(brand), move(name), price, stock), kind_(kind),
+          capacityGb_(capacityGb), speedNote_(move(speedNote)) {}
+
+    vector<string> specs() const override {
+        string cap = capacityGb_ >= 1000 ? to_string(capacityGb_ / 1000) + " TB"
+                                              : to_string(capacityGb_) + " GB";
+        return {string("Type: ") + storageKindName(kind_), "Capacity: " + cap, "Speed: " + speedNote_};
+    }
+
+private:
+    StorageKind kind_;
+    int capacityGb_;
+    string speedNote_;
+};
+
+class PowerSupply : public Product {
+public:
+    PowerSupply(int id, string brand, string name, long long price, int stock, int watts,
+                string rating)
+        : Product(id, Category::PowerSupply, move(brand), move(name), price, stock), watts_(watts),
+          rating_(move(rating)) {}
+
+    int watts() const { return watts_; }
+
+    vector<string> specs() const override {
+        return {"Output: " + to_string(watts_) + " W", "Efficiency: 80 PLUS " + rating_};
+    }
+
+private:
+    int watts_;
+    string rating_;
+};
+
+class PcCase : public Product {
+public:
+    PcCase(int id, string brand, string name, long long price, int stock, FormFactor maxBoard,
+           string notes)
+        : Product(id, Category::Case, move(brand), move(name), price, stock), maxBoard_(maxBoard),
+          notes_(move(notes)) {}
+
+    FormFactor maxBoard() const { return maxBoard_; }
+
+    // True when a motherboard of the given size fits in this case.
+    bool fits(FormFactor board) const { return static_cast<int>(board) <= static_cast<int>(maxBoard_); }
+
+    vector<string> specs() const override {
+        return {string("Largest motherboard: ") + formFactorName(maxBoard_), "Notes: " + notes_};
+    }
+
+private:
+    FormFactor maxBoard_;
+    string notes_;
+};
+
+class Cooler : public Product {
+public:
+    Cooler(int id, string brand, string name, long long price, int stock, string kind,
+           string details)
+        : Product(id, Category::Cooler, move(brand), move(name), price, stock), kind_(move(kind)),
+          details_(move(details)) {}
+
+    vector<string> specs() const override { return {"Type: " + kind_, "Details: " + details_}; }
+
+private:
+    string kind_, details_;
+};
+
+class Monitor : public Product {
+public:
+    Monitor(int id, string brand, string name, long long price, int stock, double inches,
+            string resolution, int hz, string panel)
+        : Product(id, Category::Monitor, move(brand), move(name), price, stock), inches_(inches),
+          resolution_(move(resolution)), hz_(hz), panel_(move(panel)) {}
+
+    vector<string> specs() const override {
+        return {"Screen size: " + num(inches_) + " inch", "Resolution: " + resolution_,
+                "Refresh rate: " + to_string(hz_) + " Hz", "Panel: " + panel_};
+    }
+
+private:
+    double inches_;
+    string resolution_;
+    int hz_;
+    string panel_;
+};
+
+class Peripheral : public Product {
+public:
+    Peripheral(int id, string brand, string name, long long price, int stock, string kind,
+               string details)
+        : Product(id, Category::Peripheral, move(brand), move(name), price, stock),
+          kind_(move(kind)), details_(move(details)) {}
+
+    vector<string> specs() const override { return {"Type: " + kind_, "Details: " + details_}; }
+
+private:
+    string kind_, details_;
+};
+
+// ============================================================ Catalog
+
+class Catalog {
+public:
+    Catalog() { populate(); }
+
+    const vector<unique_ptr<Product>>& all() const { return products_; }
+
+    Product* find(int id) const {
+        for (const auto& p : products_)
+            if (p->id() == id) return p.get();
+        return nullptr;
+    }
+
+    vector<Product*> byCategory(Category c) const {
+        vector<Product*> out;
+        for (const auto& p : products_)
+            if (p->category() == c) out.push_back(p.get());
+        return out;
+    }
+
+    // Every word you type must appear in the brand, name, category or specs (case-insensitive).
+    vector<Product*> search(const string& query) const {
+        vector<string> words;
+        istringstream in(toLower(query));
+        for (string w; in >> w;) words.push_back(w);
+        vector<Product*> out;
+        if (words.empty()) return out;
+        for (const auto& p : products_) {
+            string hay = p->fullName() + " " + categoryName(p->category());
+            for (const string& spec : p->specs()) hay += " " + spec;  // so "ddr4", "am5", "oled" work too
+            hay = toLower(hay);
+            bool matches = all_of(words.begin(), words.end(),
+                                   [&](const string& w) { return hay.find(w) != string::npos; });
+            if (matches) out.push_back(p.get());
+        }
+        return out;
+    }
+
+private:
+    vector<unique_ptr<Product>> products_;
+    int nextId_ = 1001;
+
+    // Adds a product of type T; the id is handed out automatically.
+    template <typename T, typename... Args>
+    void add(Args&&... args) {
+        products_.push_back(make_unique<T>(nextId_++, forward<Args>(args)...));
+    }
+
+    void populate() {
+        // ---- CPUs: brand, name, price, stock, socket, cores, threads, base GHz, boost GHz, TDP
+        add<Cpu>("AMD", "Ryzen 5 5600", usd(129), 14, "AM4", 6, 12, 3.5, 4.4, 65);
+        add<Cpu>("AMD", "Ryzen 5 9600X", usd(279), 12, "AM5", 6, 12, 3.9, 5.4, 65);
+        add<Cpu>("AMD", "Ryzen 5 7600X", usd(229), 10, "AM5", 6, 12, 4.7, 5.3, 105);
+        add<Cpu>("AMD", "Ryzen 7 7800X3D", usd(399), 8, "AM5", 8, 16, 4.2, 5.0, 120);
+        add<Cpu>("AMD", "Ryzen 9 9950X", usd(649), 5, "AM5", 16, 32, 4.3, 5.7, 170);
+        add<Cpu>("Intel", "Core i5-14600K", usd(319), 9, "LGA1700", 14, 20, 3.5, 5.3, 125);
+        add<Cpu>("Intel", "Core i7-14700K", usd(409), 7, "LGA1700", 20, 28, 3.4, 5.6, 125);
+        add<Cpu>("Intel", "Core i9-14900K", usd(589), 4, "LGA1700", 24, 32, 3.2, 6.0, 125);
+        add<Cpu>("Intel", "Core Ultra 7 265K", usd(394), 6, "LGA1851", 20, 20, 3.9, 5.5, 125);
+
+        // ---- GPUs: brand, name, price, stock, VRAM GB, board power W
+        add<Gpu>("NVIDIA", "GeForce RTX 4060 8GB", usd(299), 15, 8, 115);
+        add<Gpu>("NVIDIA", "GeForce RTX 4070 SUPER 12GB", usd(599), 8, 12, 220);
+        add<Gpu>("NVIDIA", "GeForce RTX 5070 12GB", usd(549), 10, 12, 250);
+        add<Gpu>("NVIDIA", "GeForce RTX 5070 Ti 16GB", usd(749), 6, 16, 300);
+        add<Gpu>("NVIDIA", "GeForce RTX 5080 16GB", usd(999), 4, 16, 360);
+        add<Gpu>("NVIDIA", "GeForce RTX 5090 32GB", usd(1999), 2, 32, 575);
+        add<Gpu>("AMD", "Radeon RX 7800 XT 16GB", usd(499), 7, 16, 263);
+        add<Gpu>("AMD", "Radeon RX 9070 XT 16GB", usd(599), 6, 16, 304);
+
+        // ---- Motherboards: brand, name, price, stock, socket, chipset, memory type, size, wifi
+        add<Motherboard>("ASUS", "TUF GAMING B550-PLUS WIFI II", usd(159), 8, "AM4", "B550", "DDR4", FormFactor::ATX, true);
+        add<Motherboard>("ASUS", "TUF GAMING B650-PLUS WIFI", usd(199), 9, "AM5", "B650", "DDR5", FormFactor::ATX, true);
+        add<Motherboard>("MSI", "MAG B650 TOMAHAWK WIFI", usd(219), 7, "AM5", "B650", "DDR5", FormFactor::ATX, true);
+        add<Motherboard>("Gigabyte", "X870 AORUS ELITE WIFI7", usd(279), 5, "AM5", "X870", "DDR5", FormFactor::ATX, true);
+        add<Motherboard>("ASUS", "ROG STRIX B650E-I GAMING WIFI", usd(299), 3, "AM5", "B650E", "DDR5", FormFactor::MiniITX, true);
+        add<Motherboard>("Gigabyte", "B760M DS3H DDR4", usd(109), 10, "LGA1700", "B760", "DDR4", FormFactor::MicroATX, false);
+        add<Motherboard>("MSI", "PRO Z790-P WIFI", usd(199), 6, "LGA1700", "Z790", "DDR5", FormFactor::ATX, true);
+        add<Motherboard>("ASUS", "PRIME Z890-P WIFI", usd(259), 5, "LGA1851", "Z890", "DDR5", FormFactor::ATX, true);
+
+        // ---- Memory: brand, name, price, stock, type, total GB, kit, MT/s, CAS
+        add<Memory>("Kingston", "FURY Beast 16GB", usd(39), 20, "DDR4", 16, "2 x 8 GB", 3200, 16);
+        add<Memory>("Corsair", "Vengeance LPX 32GB", usd(69), 15, "DDR4", 32, "2 x 16 GB", 3600, 18);
+        add<Memory>("Corsair", "Vengeance 32GB", usd(109), 18, "DDR5", 32, "2 x 16 GB", 6000, 30);
+        add<Memory>("G.Skill", "Trident Z5 RGB 32GB", usd(129), 12, "DDR5", 32, "2 x 16 GB", 6400, 32);
+        add<Memory>("G.Skill", "Trident Z5 Neo RGB 64GB", usd(229), 6, "DDR5", 64, "2 x 32 GB", 6000, 30);
+
+        // ---- Storage: brand, name, price, stock, kind, capacity GB, speed note
+        add<Storage>("Crucial", "P3 Plus 1TB", usd(59), 20, StorageKind::NVMe, 1000, "up to 5,000 MB/s read (PCIe 4.0)");
+        add<Storage>("Samsung", "990 PRO 1TB", usd(109), 14, StorageKind::NVMe, 1000, "up to 7,450 MB/s read (PCIe 4.0)");
+        add<Storage>("Samsung", "990 PRO 2TB", usd(179), 9, StorageKind::NVMe, 2000, "up to 7,450 MB/s read (PCIe 4.0)");
+        add<Storage>("WD", "Black SN850X 2TB", usd(159), 8, StorageKind::NVMe, 2000, "up to 7,300 MB/s read (PCIe 4.0)");
+        add<Storage>("Crucial", "MX500 1TB", usd(69), 16, StorageKind::SataSsd, 1000, "up to 560 MB/s read (SATA III)");
+        add<Storage>("Seagate", "BarraCuda 4TB", usd(85), 12, StorageKind::Hdd, 4000, "5,400 RPM, 256 MB cache");
+
+        // ---- Power supplies: brand, name, price, stock, watts, 80 PLUS rating
+        add<PowerSupply>("be quiet!", "Pure Power 12 M 650W", usd(89), 10, 650, "Gold");
+        add<PowerSupply>("Corsair", "RM750e", usd(99), 14, 750, "Gold");
+        add<PowerSupply>("Corsair", "RM850x", usd(139), 10, 850, "Gold");
+        add<PowerSupply>("Seasonic", "FOCUS GX-1000", usd(189), 6, 1000, "Gold");
+        add<PowerSupply>("Corsair", "HX1200i", usd(249), 4, 1200, "Platinum");
+
+        // ---- Cases: brand, name, price, stock, largest board, notes
+        add<PcCase>("Cooler Master", "MasterBox Q300L", usd(55), 9, FormFactor::MicroATX, "Compact tower, magnetic dust filters");
+        add<PcCase>("NZXT", "H5 Flow", usd(95), 11, FormFactor::ATX, "Mid tower, 2 front fans included");
+        add<PcCase>("Corsair", "4000D Airflow", usd(104), 10, FormFactor::ATX, "Mid tower, high-airflow mesh front");
+        add<PcCase>("Lian Li", "LANCOOL 216", usd(99), 8, FormFactor::ATX, "Mid tower, 2 large front fans included");
+        add<PcCase>("Fractal Design", "North", usd(139), 6, FormFactor::ATX, "Mid tower, real wood front panel");
+        add<PcCase>("Cooler Master", "NR200P", usd(99), 5, FormFactor::MiniITX, "Small-form-factor, mesh panels");
+
+        // ---- Coolers: brand, name, price, stock, kind, details
+        add<Cooler>("DeepCool", "AK400", usd(30), 18, "Air", "Single-tower, 1 x 120 mm fan");
+        add<Cooler>("Thermalright", "Peerless Assassin 120 SE", usd(35), 16, "Air", "Dual-tower, 2 x 120 mm fans");
+        add<Cooler>("Noctua", "NH-D15", usd(110), 9, "Air", "Dual-tower, 2 x 140 mm fans");
+        add<Cooler>("ARCTIC", "Liquid Freezer III 360", usd(120), 7, "Liquid", "360 mm all-in-one radiator");
+        add<Cooler>("Corsair", "iCUE H150i ELITE LCD XT", usd(279), 4, "Liquid", "360 mm all-in-one with LCD pump screen");
+
+        // ---- Monitors: brand, name, price, stock, inches, resolution, Hz, panel
+        add<Monitor>("AOC", "24G2", usd(149), 12, 24.0, "1920 x 1080 (Full HD)", 144, "IPS");
+        add<Monitor>("LG", "UltraGear 27GP850-B", usd(299), 8, 27.0, "2560 x 1440 (QHD)", 165, "Nano IPS");
+        add<Monitor>("Dell", "S2721QS", usd(299), 7, 27.0, "3840 x 2160 (4K)", 60, "IPS");
+        add<Monitor>("ASUS", "ROG Swift OLED PG27AQDM", usd(899), 3, 26.5, "2560 x 1440 (QHD)", 240, "OLED");
+
+        // ---- Peripherals: brand, name, price, stock, kind, details
+        add<Peripheral>("Logitech", "G502 X", usd(80), 15, "Mouse", "Wired gaming mouse, 25,600 DPI");
+        add<Peripheral>("Razer", "DeathAdder V3", usd(70), 12, "Mouse", "Wired esports mouse, 59 g, 30,000 DPI");
+        add<Peripheral>("Logitech", "MX Keys S", usd(110), 10, "Keyboard", "Full-size wireless, backlit keys");
+        add<Peripheral>("Corsair", "K70 RGB PRO", usd(160), 8, "Keyboard", "Full-size mechanical, Cherry MX switches");
+        add<Peripheral>("HyperX", "Cloud II", usd(99), 11, "Headset", "Wired gaming headset, 7.1 virtual surround");
+        add<Peripheral>("Logitech", "C920 HD Pro", usd(70), 13, "Webcam", "1080p at 30 fps, built-in stereo mics");
+    }
+};
+
+// ============================================================ Basket
+
+struct BasketItem {
+    Product* product;
+    int quantity;
+    long long lineTotalCents() const { return product->priceCents() * quantity; }
+};
+
+class Basket {
+public:
+    const vector<BasketItem>& items() const { return items_; }
+    bool empty() const { return items_.empty(); }
+
+    int unitCount() const {
+        int n = 0;
+        for (const auto& it : items_) n += it.quantity;
+        return n;
+    }
+
+    long long totalCents() const {
+        long long t = 0;
+        for (const auto& it : items_) t += it.lineTotalCents();
+        return t;
+    }
+
+    int quantityOf(const Product& p) const {
+        for (const auto& it : items_)
+            if (it.product == &p) return it.quantity;
+        return 0;
+    }
+
+    // All of these report a human-readable result in `msg`.
+    bool add(Product& p, int qty, string& msg) {
+        if (qty <= 0) {
+            msg = "Quantity must be at least 1.";
+            return false;
+        }
+        int have = quantityOf(p);
+        if (have + qty > p.stock()) {
+            msg = "Not enough stock: only " + to_string(p.stock()) + " available (you already have " +
+                  to_string(have) + " in your basket).";
+            return false;
+        }
+        bool merged = false;
+        for (auto& it : items_)
+            if (it.product == &p) {
+                it.quantity += qty;
+                merged = true;
+            }
+        if (!merged) items_.push_back({&p, qty});
+        msg = "Added " + to_string(qty) + " x " + p.fullName() + " to your basket.";
+        return true;
+    }
+
+    bool removeAt(size_t index, string& msg) {
+        if (index >= items_.size()) {
+            msg = "There is no such item in your basket.";
+            return false;
+        }
+        msg = "Removed " + items_[index].product->fullName() + " from your basket.";
+        items_.erase(items_.begin() + static_cast<ptrdiff_t>(index));
+        return true;
+    }
+
+    bool setQuantityAt(size_t index, int qty, string& msg) {
+        if (index >= items_.size()) {
+            msg = "There is no such item in your basket.";
+            return false;
+        }
+        if (qty <= 0) return removeAt(index, msg);
+        BasketItem& it = items_[index];
+        if (qty > it.product->stock()) {
+            msg = "Not enough stock: only " + to_string(it.product->stock()) + " available.";
+            return false;
+        }
+        it.quantity = qty;
+        msg = "Quantity of " + it.product->fullName() + " is now " + to_string(qty) + ".";
+        return true;
+    }
+
+    void clear() { items_.clear(); }
+
+private:
+    vector<BasketItem> items_;
+};
+
+// ============================================================ CompatibilityChecker
+
+class CompatibilityChecker {
+public:
+    // Returns lines such as "[OK] ..." or "[!] ...". Empty if there is nothing to compare yet.
+    static vector<string> check(const Basket& basket) {
+        vector<string> out;
+        int nCpu = 0, nBoard = 0, nRam = 0, nCase = 0, nGpu = 0, nPsu = 0;
+        const Cpu* cpu = findPart<Cpu>(basket, nCpu);
+        const Motherboard* board = findPart<Motherboard>(basket, nBoard);
+        const Memory* ram = findPart<Memory>(basket, nRam);
+        const PcCase* pcCase = findPart<PcCase>(basket, nCase);
+        const Gpu* gpu = findPart<Gpu>(basket, nGpu);
+        const PowerSupply* psu = findPart<PowerSupply>(basket, nPsu);
+
+        if (nCpu > 1) out.push_back("[!] You have more than one CPU in your basket.");
+        if (nBoard > 1) out.push_back("[!] You have more than one motherboard in your basket.");
+        if (nCase > 1) out.push_back("[!] You have more than one case in your basket.");
+        if (nPsu > 1) out.push_back("[!] You have more than one power supply in your basket.");
+
+        if (cpu && board) {
+            if (cpu->socket() == board->socket())
+                out.push_back("[OK] CPU and motherboard share the " + cpu->socket() + " socket.");
+            else
+                out.push_back("[!] CPU socket " + cpu->socket() + " does not match the motherboard socket " +
+                              board->socket() + ".");
+        }
+        if (ram && board) {
+            if (ram->type() == board->memoryType())
+                out.push_back("[OK] " + ram->type() + " memory matches the motherboard.");
+            else
+                out.push_back("[!] The memory is " + ram->type() + " but the motherboard needs " +
+                              board->memoryType() + ".");
+        }
+        if (pcCase && board) {
+            if (pcCase->fits(board->formFactor()))
+                out.push_back(string("[OK] The ") + formFactorName(board->formFactor()) +
+                              " motherboard fits in the case.");
+            else
+                out.push_back(string("[!] The ") + formFactorName(board->formFactor()) +
+                              " motherboard will not fit in this case, which only takes up to " +
+                              formFactorName(pcCase->maxBoard()) + ".");
+        }
+        if (psu && (cpu || gpu)) {
+            int need = 150 + (cpu ? cpu->tdpW() : 0) + (gpu ? gpu->tdpW() : 0);  // 150 W for the rest of the PC
+            if (psu->watts() >= need)
+                out.push_back("[OK] The " + to_string(psu->watts()) + " W power supply covers the estimated " +
+                              to_string(need) + " W need.");
+            else
+                out.push_back("[!] The " + to_string(psu->watts()) + " W power supply is too small: about " +
+                              to_string(need) + " W is recommended.");
+        }
+        return out;
+    }
+
+private:
+    // First part of type T in the basket; `count` receives how many units of that type there are.
+    template <typename T>
+    static const T* findPart(const Basket& basket, int& count) {
+        const T* found = nullptr;
+        count = 0;
+        for (const auto& it : basket.items())
+            if (const T* p = dynamic_cast<const T*>(it.product)) {
+                if (!found) found = p;
+                count += it.quantity;
+            }
+        return found;
+    }
+};
+
+// ============================================================ Console (input helpers)
+
+struct InputClosed {};  // thrown when the keyboard input ends (Ctrl+D / Ctrl+Z)
+
+class Console {
+public:
+    static string readLine(const string& prompt) {
+        cout << prompt << flush;
+        string text;
+        if (!getline(cin, text)) throw InputClosed{};
+        return trim(text);
+    }
+
+    static int readInt(const string& prompt, int lo, int hi) {
+        for (;;) {
+            string text = readLine(prompt);
+            try {
+                size_t used = 0;
+                int v = stoi(text, &used);
+                if (used == text.size() && v >= lo && v <= hi) return v;
+            } catch (const exception&) {
+                // fall through to the message below
+            }
+            cout << "  Please enter a number from " << lo << " to " << hi << ".\n";
+        }
+    }
+};
+
+// ============================================================ Store (menus and flow)
+
+class Store {
+public:
+    void run() {
+        cout << "\n" << line('=', 64) << "\n"
+                  << "                     PC PARTS STORE\n"
+                  << "     Build your own computer - parts, peripherals, monitors\n"
+                  << line('=', 64) << "\n";
+        for (;;) {
+            cout << "\n--- MAIN MENU ---   Basket: " << basket_.unitCount() << " item(s), "
+                      << formatMoney(basket_.totalCents()) << "\n"
+                      << "  1. Browse by category\n"
+                      << "  2. Search products\n"
+                      << "  3. Show every product\n"
+                      << "  4. View basket (remove items / change quantity)\n"
+                      << "  5. Checkout\n"
+                      << "  0. Exit\n";
+            switch (Console::readInt("Choose: ", 0, 5)) {
+                case 1: browseCategories(); break;
+                case 2: searchProducts(); break;
+                case 3: showProductList(allProducts(), "ALL PRODUCTS"); break;
+                case 4: viewBasket(); break;
+                case 5: checkout(); break;
+                case 0:
+                    cout << "\nThanks for visiting. Goodbye!\n";
+                    return;
+            }
+        }
+    }
+
+private:
+    Catalog catalog_;
+    Basket basket_;
+    int orderNumber_ = 0;
+
+    vector<Product*> allProducts() const {
+        vector<Product*> v;
+        for (const auto& p : catalog_.all()) v.push_back(p.get());
+        return v;
+    }
+
+    // ---------------------------------------------------------------- browsing
+
+    void browseCategories() {
+        for (;;) {
+            cout << "\n--- CATEGORIES ---\n";
+            for (size_t i = 0; i < kAllCategories.size(); ++i)
+                cout << "  " << (i + 1) << ". " << categoryName(kAllCategories[i]) << "\n";
+            cout << "  0. Back\n";
+            int c = Console::readInt("Choose: ", 0, static_cast<int>(kAllCategories.size()));
+            if (c == 0) return;
+            Category cat = kAllCategories[static_cast<size_t>(c - 1)];
+            showProductList(catalog_.byCategory(cat), categoryName(cat));
+        }
+    }
+
+    void searchProducts() {
+        string q = Console::readLine("\nSearch (e.g. \"rtx 5070\", \"ddr5\", \"samsung\"): ");
+        if (q.empty()) return;
+        showProductList(catalog_.search(q), "SEARCH RESULTS FOR \"" + q + "\"");
+    }
+
+    void showProductList(const vector<Product*>& products, const string& title) {
+        if (products.empty()) {
+            cout << "\nNo products found.\n";
+            return;
+        }
+        for (;;) {
+            cout << "\n=== " << title << " ===\n"
+                      << fit("ID", 6) << fit("PRODUCT", 44) << padLeft("PRICE", 11) << "  " << "STOCK\n"
+                      << line('-', 72) << "\n";
+            for (const Product* p : products) {
+                string stock = p->stock() > 0 ? to_string(p->stock()) + " left" : "SOLD OUT";
+                cout << fit(to_string(p->id()), 6) << fit(p->fullName(), 44)
+                          << padLeft(formatMoney(p->priceCents()), 11) << "  " << stock << "\n";
+            }
+            int id = Console::readInt("\nEnter a product ID to view it / add it to the basket (0 = back): ", 0, 999999);
+            if (id == 0) return;
+            auto it = find_if(products.begin(), products.end(), [id](const Product* p) { return p->id() == id; });
+            if (it == products.end()) {
+                cout << "  That ID is not in this list.\n";
+                continue;
+            }
+            showProduct(**it);
+        }
+    }
+
+    void showProduct(Product& p) {
+        cout << "\n" << line('=', 64) << "\n"
+                  << p.fullName() << "\n"
+                  << line('-', 64) << "\n"
+                  << "  Category : " << categoryName(p.category()) << "\n"
+                  << "  Price    : " << formatMoney(p.priceCents()) << "\n"
+                  << "  In stock : " << p.stock() << "\n";
+        for (const string& s : p.specs()) cout << "  " << s << "\n";
+        cout << line('=', 64) << "\n";
+
+        int inBasket = basket_.quantityOf(p);
+        if (inBasket > 0) cout << "  (You already have " << inBasket << " of these in your basket.)\n";
+
+        int room = p.stock() - inBasket;
+        if (room <= 0) {
+            cout << (p.stock() == 0 ? "  This product is sold out.\n"
+                                         : "  Your basket already holds all the stock of this product.\n");
+            return;
+        }
+        cout << "  1. Add to basket\n  0. Back\n";
+        if (Console::readInt("Choose: ", 0, 1) != 1) return;
+        int qty = Console::readInt("Quantity (1-" + to_string(room) + "): ", 1, room);
+        string msg;
+        basket_.add(p, qty, msg);
+        cout << "  " << msg << "\n";
+    }
+
+    // ---------------------------------------------------------------- basket
+
+    void printBasket() const {
+        cout << "\n=== YOUR BASKET ===\n"
+                  << fit("#", 4) << fit("PRODUCT", 40) << padLeft("PRICE", 11) << padLeft("QTY", 5)
+                  << padLeft("TOTAL", 13) << "\n"
+                  << line('-', 73) << "\n";
+        int n = 1;
+        for (const BasketItem& it : basket_.items()) {
+            cout << fit(to_string(n++), 4) << fit(it.product->fullName(), 40)
+                      << padLeft(formatMoney(it.product->priceCents()), 11) << padLeft(to_string(it.quantity), 5)
+                      << padLeft(formatMoney(it.lineTotalCents()), 13) << "\n";
+        }
+        cout << line('-', 73) << "\n"
+                  << fit("", 4) << fit("TOTAL (" + to_string(basket_.unitCount()) + " items)", 56)
+                  << padLeft(formatMoney(basket_.totalCents()), 13) << "\n";
+
+        auto notes = CompatibilityChecker::check(basket_);
+        if (!notes.empty()) {
+            cout << "\nCompatibility check:\n";
+            for (const string& s : notes) cout << "  " << s << "\n";
+        }
+    }
+
+    void viewBasket() {
+        for (;;) {
+            if (basket_.empty()) {
+                cout << "\nYour basket is empty.\n";
+                return;
+            }
+            printBasket();
+            cout << "\n  1. Remove an item\n"
+                      << "  2. Change an item's quantity\n"
+                      << "  3. Empty the basket\n"
+                      << "  4. Checkout\n"
+                      << "  0. Back\n";
+            string msg;
+            int count = static_cast<int>(basket_.items().size());
+            switch (Console::readInt("Choose: ", 0, 4)) {
+                case 1: {
+                    int n = Console::readInt("Item number to remove (0 = cancel): ", 0, count);
+                    if (n > 0) {
+                        basket_.removeAt(static_cast<size_t>(n - 1), msg);
+                        cout << "  " << msg << "\n";
+                    }
+                    break;
+                }
+                case 2: {
+                    int n = Console::readInt("Item number to change (0 = cancel): ", 0, count);
+                    if (n > 0) {
+                        int q = Console::readInt("New quantity (0 = remove): ", 0, 999);
+                        basket_.setQuantityAt(static_cast<size_t>(n - 1), q, msg);
+                        cout << "  " << msg << "\n";
+                    }
+                    break;
+                }
+                case 3:
+                    if (Console::readInt("Really empty the basket? 1 = yes, 0 = no: ", 0, 1) == 1) {
+                        basket_.clear();
+                        cout << "  Basket emptied.\n";
+                    }
+                    break;
+                case 4: checkout(); return;
+                case 0: return;
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- checkout
+
+    void checkout() {
+        if (basket_.empty()) {
+            cout << "\nYour basket is empty - add something first.\n";
+            return;
+        }
+        printBasket();
+        cout << "\n";
+        if (Console::readInt("Place this order? 1 = yes, 0 = no: ", 0, 1) != 1) return;
+
+        string customer = Console::readLine("Your name (for the receipt): ");
+        if (customer.empty()) customer = "Customer";
+
+        // Take the stock first; if anything fails nothing is sold.
+        for (const BasketItem& it : basket_.items()) {
+            if (it.quantity > it.product->stock()) {
+                cout << "  Sorry, " << it.product->fullName() << " is no longer available in that quantity.\n";
+                return;
+            }
+        }
+        for (const BasketItem& it : basket_.items()) it.product->takeStock(it.quantity);
+
+        ++orderNumber_;
+        string receipt = buildReceipt(customer);
+        cout << "\n" << receipt;
+
+        string file = "receipt_" + timestamp("%Y%m%d_%H%M%S") + "_" + to_string(orderNumber_) + ".txt";
+        ofstream out(file);
+        if (out) {
+            out << receipt;
+            cout << "Receipt saved to " << file << "\n";
+        } else {
+            cout << "(Could not save the receipt file.)\n";
+        }
+        basket_.clear();
+    }
+
+    string buildReceipt(const string& customer) const {
+        ostringstream r;
+        r << line('=', 64) << "\n"
+          << "                     PC PARTS STORE - RECEIPT\n"
+          << line('=', 64) << "\n"
+          << "Order #  : " << orderNumber_ << "\n"
+          << "Date     : " << timestamp("%Y-%m-%d %H:%M:%S") << "\n"
+          << "Customer : " << customer << "\n"
+          << line('-', 64) << "\n";
+        for (const BasketItem& it : basket_.items())
+            r << fit(to_string(it.quantity) + " x " + it.product->fullName(), 49)
+              << padLeft(formatMoney(it.lineTotalCents()), 15) << "\n";
+        r << line('-', 64) << "\n"
+          << fit("TOTAL", 49) << padLeft(formatMoney(basket_.totalCents()), 15) << "\n"
+          << line('=', 64) << "\n"
+          << "Thank you for your order!\n";
+        return r.str();
+    }
+};
+
+// ============================================================ main
+
+int main() {
+    try {
+        Store store;
+        store.run();
+    } catch (const InputClosed&) {
+        cout << "\nInput closed. Goodbye!\n";
+    }
+    return 0;
+}
